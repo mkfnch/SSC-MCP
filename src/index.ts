@@ -42,7 +42,7 @@ async function startStdioTransport(): Promise<void> {
   const server = createServer();
   const apiKey = config.ssc.apiKey;
   if (!apiKey) {
-    logger.error('SSC_API_KEY environment variable is required for stdio mode');
+    logger.error('SSC_API_KEY (or SSC_API_TOKEN) environment variable is required for stdio mode');
     process.exit(1);
   }
 
@@ -120,7 +120,7 @@ async function startHttpTransport(): Promise<void> {
       if (!apiKey) {
         res.status(401).json({
           jsonrpc: '2.0',
-          error: { code: -32000, message: 'SecurityScorecard API key required. Provide via Authorization header or SSC_API_KEY env var.' },
+          error: { code: -32000, message: 'SecurityScorecard API key required. Provide via Authorization header or SSC_API_KEY/SSC_API_TOKEN env var.' },
           id: null,
         });
         return;
@@ -210,5 +210,7 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   logger.fatal({ err: error }, 'Failed to start server');
+  // Also write to stderr directly in case logger transport hasn't initialized
+  process.stderr.write(`FATAL: Failed to start server: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);
 });
