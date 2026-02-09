@@ -14,6 +14,16 @@ import { SecurityScorecardService } from './services/securityscorecard.service.j
 import { registerAllTools } from './tools/index.js';
 import { registerResources } from './resources/scorecard.resources.js';
 
+// Global error handlers — prevent silent crashes in Claude Desktop
+process.on('uncaughtException', (error) => {
+  logger.fatal({ err: error }, 'Uncaught exception');
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ err: reason }, 'Unhandled promise rejection');
+  process.exit(1);
+});
+
 const config = loadConfig();
 
 function createServer(): McpServer {
@@ -42,8 +52,10 @@ async function startStdioTransport(): Promise<void> {
   const server = createServer();
   const apiKey = config.ssc.apiKey;
   if (!apiKey) {
-    logger.error('SSC_API_KEY environment variable is required for stdio mode');
-    process.exit(1);
+    throw new Error(
+      'SSC_API_KEY environment variable is required. ' +
+      'Set it in your Claude Desktop MCP config under "env": { "SSC_API_KEY": "your-key" }'
+    );
   }
 
   setupTools(server, apiKey);
