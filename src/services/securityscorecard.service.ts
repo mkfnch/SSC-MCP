@@ -68,6 +68,7 @@ export class SecurityScorecardService {
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(30_000), // 30 s — prevent hanging requests from stalling the MCP server
     });
 
     if (!response.ok) {

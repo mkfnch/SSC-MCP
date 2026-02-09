@@ -2,11 +2,6 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import express from 'express';
-import cors from 'cors';
-import { randomUUID } from 'node:crypto';
 
 import { loadConfig } from './utils/config.js';
 import { logger } from './utils/logger.js';
@@ -14,14 +9,16 @@ import { SecurityScorecardService } from './services/securityscorecard.service.j
 import { registerAllTools } from './tools/index.js';
 import { registerResources } from './resources/scorecard.resources.js';
 
-// Global error handlers — prevent silent crashes in Claude Desktop
+// Global error handlers — prevent silent crashes in Claude Desktop.
+// uncaughtException is fatal (process state is unreliable), but
+// unhandledRejection is logged-and-continued so a transient API hiccup
+// does not tear down the whole MCP session.
 process.on('uncaughtException', (error) => {
   logger.fatal({ err: error }, 'Uncaught exception');
   process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
-  logger.fatal({ err: reason }, 'Unhandled promise rejection');
-  process.exit(1);
+  logger.error({ err: reason }, 'Unhandled promise rejection (non-fatal)');
 });
 
 const config = loadConfig();
@@ -63,9 +60,40 @@ async function startStdioTransport(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info('SecurityScorecard MCP server running on stdio');
+
+  // Graceful shutdown — close the transport cleanly so Claude Desktop
+  // sees a proper disconnect instead of "transport closed unexpectedly".
+  const shutdown = async () => {
+    logger.info('Shutting down stdio transport');
+    try {
+      await server.close();
+    } catch {
+      // best-effort
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 async function startHttpTransport(): Promise<void> {
+  // Dynamic imports — these modules are only needed for HTTP mode and
+  // loading them eagerly in stdio mode risks stdout side-effects during
+  // module init that corrupt the JSON-RPC stream.
+  const [
+    { StreamableHTTPServerTransport },
+    { isInitializeRequest },
+    { default: express },
+    { default: cors },
+    { randomUUID },
+  ] = await Promise.all([
+    import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
+    import('@modelcontextprotocol/sdk/types.js'),
+    import('express'),
+    import('cors'),
+    import('node:crypto'),
+  ]);
+
   const app = express();
   app.use(express.json());
   app.use(cors({
@@ -74,7 +102,7 @@ async function startHttpTransport(): Promise<void> {
     allowedHeaders: ['Content-Type', 'mcp-session-id', 'Authorization'],
   }));
 
-  const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
+  const sessions = new Map<string, { transport: InstanceType<typeof StreamableHTTPServerTransport>; server: McpServer }>();
 
   // Health check endpoint
   app.get('/health', (_req, res) => {
@@ -107,7 +135,7 @@ async function startHttpTransport(): Promise<void> {
   // MCP Streamable HTTP endpoint (POST)
   app.post('/mcp', async (req, res) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    let transport: StreamableHTTPServerTransport;
+    let transport: InstanceType<typeof StreamableHTTPServerTransport>;
     let server: McpServer;
 
     if (sessionId && sessions.has(sessionId)) {
