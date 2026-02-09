@@ -50,7 +50,7 @@ async function startStdioTransport(): Promise<void> {
   const apiKey = config.ssc.apiKey;
   if (!apiKey) {
     throw new Error(
-      'SSC_API_KEY environment variable is required. ' +
+      'SSC_API_KEY (or SSC_API_TOKEN) environment variable is required. ' +
       'Set it in your Claude Desktop MCP config under "env": { "SSC_API_KEY": "your-key" }'
     );
   }
