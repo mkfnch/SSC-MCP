@@ -327,9 +327,20 @@ export class SecurityScorecardService {
   // ── Attack Surface Intelligence (ASI) ──
 
   async searchAttackSurface(query: string, filters?: Record<string, unknown>): Promise<ASISearchResult> {
+    // Build the filters object first, explicitly excluding the 'query' key to
+    // prevent a caller-supplied filter from overriding the required query field
+    // (property-override / object-injection vulnerability).
+    const safeFilters: Record<string, unknown> = {};
+    if (filters) {
+      for (const [key, value] of Object.entries(filters)) {
+        if (key !== 'query') {
+          safeFilters[key] = value;
+        }
+      }
+    }
     return this.request('/asi/search', {
       method: 'POST',
-      body: { query, ...filters },
+      body: { ...safeFilters, query },
     });
   }
 

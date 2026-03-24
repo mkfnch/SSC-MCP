@@ -1,0 +1,36 @@
+# Dependencies – installed fresh inside the image
+node_modules/
+
+# Build output – rebuilt inside the image
+dist/
+
+# Secrets and local configuration – MUST NOT enter the build context
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Version-control metadata
+.git/
+.gitignore
+
+# Development and test artefacts
+coverage/
+*.test.ts
+*.spec.ts
+vitest.config.*
+
+# Editor and OS artefacts
+.vscode/
+.idea/
+.DS_Store
+*.tgz
+*.log
+
+# CI/CD files not needed at runtime
+.github/
+Jenkinsfile
+.circleci/

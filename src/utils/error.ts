@@ -1,5 +1,12 @@
 import { logger } from './logger.js';
 
+/**
+ * When running in production, error responses sent to MCP clients are stripped
+ * of internal details (endpoint paths, status codes) to avoid leaking API
+ * structure. Full details are still emitted to the server-side log.
+ */
+const isProduction = (process.env.NODE_ENV ?? 'production') === 'production';
+
 export class SecurityScorecardError extends Error {
   public readonly statusCode: number;
   public readonly endpoint: string;
@@ -32,26 +39,50 @@ export class RateLimitError extends SecurityScorecardError {
 }
 
 function formatMcpError(error: unknown): { type: 'text'; text: string } {
-  if (error instanceof SecurityScorecardError) {
-    logger.error({ err: error, endpoint: error.endpoint, statusCode: error.statusCode }, 'SecurityScorecard API error');
+  if (error instanceof RateLimitError) {
+    logger.error(
+      { err: error, endpoint: error.endpoint, statusCode: error.statusCode },
+      'SecurityScorecard rate limit hit'
+    );
     return {
       type: 'text',
       text: JSON.stringify({
-        error: error.message,
-        statusCode: error.statusCode,
-        endpoint: error.endpoint,
+        error: 'Rate limit exceeded. Please wait before retrying.',
+        retryable: true,
+        ...(isProduction ? {} : { endpoint: error.endpoint, retryAfter: error.retryAfter }),
+      }),
+    };
+  }
+
+  if (error instanceof SecurityScorecardError) {
+    logger.error(
+      { err: error, endpoint: error.endpoint, statusCode: error.statusCode },
+      'SecurityScorecard API error'
+    );
+    return {
+      type: 'text',
+      text: JSON.stringify({
+        error: isProduction
+          ? 'An API error occurred. Please check your request and try again.'
+          : error.message,
         retryable: error.retryable,
+        ...(isProduction ? {} : { statusCode: error.statusCode, endpoint: error.endpoint }),
       }),
     };
   }
 
   if (error instanceof Error) {
     logger.error({ err: error }, 'Unexpected error');
-    return { type: 'text', text: JSON.stringify({ error: error.message }) };
+    return {
+      type: 'text',
+      text: JSON.stringify({
+        error: isProduction ? 'An unexpected error occurred.' : error.message,
+      }),
+    };
   }
 
   logger.error({ err: error }, 'Unknown error');
-  return { type: 'text', text: JSON.stringify({ error: 'An unexpected error occurred' }) };
+  return { type: 'text', text: JSON.stringify({ error: 'An unexpected error occurred.' }) };
 }
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
