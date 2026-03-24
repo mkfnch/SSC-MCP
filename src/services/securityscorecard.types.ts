@@ -1,13 +1,3 @@
-export interface CompanySummary {
-  name: string;
-  domain: string;
-  grade: string;
-  score: number;
-  industry: string;
-  size: string;
-  last30days_score_change: number;
-}
-
 export interface FactorScore {
   name: string;
   grade: string;

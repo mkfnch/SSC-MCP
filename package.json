@@ -4,9 +4,7 @@
   "description": "SecurityScorecard MCP Connector - Enterprise security intelligence integration for Claude",
   "type": "module",
   "main": "dist/index.js",
-  "bin": {
-    "securityscorecard-mcp": "dist/index.js"
-  },
+  "bin": "dist/index.js",
   "scripts": {
     "build": "tsc && chmod 755 dist/index.js",
     "dev": "tsx watch src/index.ts",
@@ -15,8 +13,7 @@
     "mcp:http": "TRANSPORT_MODE=http node dist/index.js",
     "inspector": "npx @modelcontextprotocol/inspector dist/index.js",
     "test": "vitest",
-    "test:coverage": "vitest --coverage",
-    "lint": "eslint src --ext .ts"
+    "test:coverage": "vitest --coverage"
   },
   "keywords": [
     "mcp",
@@ -36,8 +33,7 @@
     "@modelcontextprotocol/sdk": "^1.12.1",
     "cors": "^2.8.5",
     "express": "^5.1.0",
-    "jose": "^6.0.11",
-    "pino": "^9.6.0",
+"pino": "^9.6.0",
     "zod": "^3.25.67"
   },
   "devDependencies": {
