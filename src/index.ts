@@ -2,11 +2,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import express from 'express';
-import cors from 'cors';
-import { randomUUID } from 'node:crypto';
+import type { StreamableHTTPServerTransport as StreamableHTTPServerTransportType } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 import { loadConfig } from './utils/config.js';
@@ -14,6 +10,18 @@ import { logger } from './utils/logger.js';
 import { SecurityScorecardService } from './services/securityscorecard.service.js';
 import { registerAllTools } from './tools/index.js';
 import { registerResources } from './resources/scorecard.resources.js';
+
+// Global error handlers — prevent silent crashes in Claude Desktop.
+// uncaughtException is fatal (process state is unreliable), but
+// unhandledRejection is logged-and-continued so a transient API hiccup
+// does not tear down the whole MCP session.
+process.on('uncaughtException', (error) => {
+  logger.fatal({ err: error }, 'Uncaught exception');
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error({ err: reason }, 'Unhandled promise rejection (non-fatal)');
+});
 
 const config = loadConfig();
 
@@ -112,8 +120,10 @@ async function startStdioTransport(): Promise<void> {
   const server = createServer();
   const apiKey = config.ssc.apiKey;
   if (!apiKey) {
-    logger.error('SSC_API_KEY (or SSC_API_TOKEN) environment variable is required for stdio mode');
-    process.exit(1);
+    throw new Error(
+      'SSC_API_KEY (or SSC_API_TOKEN) environment variable is required. ' +
+      'Set it in your Claude Desktop MCP config under "env": { "SSC_API_KEY": "your-key" }'
+    );
   }
 
   setupTools(server, apiKey);
@@ -121,6 +131,20 @@ async function startStdioTransport(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info('SecurityScorecard MCP server running on stdio');
+
+  // Graceful shutdown — close the transport cleanly so Claude Desktop
+  // sees a proper disconnect instead of "transport closed unexpectedly".
+  const shutdown = async () => {
+    logger.info('Shutting down stdio transport');
+    try {
+      await server.close();
+    } catch {
+      // best-effort
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // ── HTTP transport ────────────────────────────────────────────────────────────
@@ -129,6 +153,23 @@ async function startStdioTransport(): Promise<void> {
 const SESSION_TTL_MS = 30 * 60_000; // 30 minutes
 
 async function startHttpTransport(): Promise<void> {
+  // Dynamic imports — these modules are only needed for HTTP mode and
+  // loading them eagerly in stdio mode risks stdout side-effects during
+  // module init that corrupt the JSON-RPC stream.
+  const [
+    { StreamableHTTPServerTransport },
+    { isInitializeRequest },
+    { default: express },
+    { default: cors },
+    { randomUUID },
+  ] = await Promise.all([
+    import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
+    import('@modelcontextprotocol/sdk/types.js'),
+    import('express'),
+    import('cors'),
+    import('node:crypto'),
+  ]);
+
   const app = express();
 
   // ── Security response headers ─────────────────────────────────────────────
@@ -174,7 +215,7 @@ async function startHttpTransport(): Promise<void> {
   // ── Session store with TTL enforcement ────────────────────────────────────
   const sessions = new Map<
     string,
-    { transport: StreamableHTTPServerTransport; server: McpServer; lastActivity: number }
+    { transport: StreamableHTTPServerTransportType; server: McpServer; lastActivity: number }
   >();
 
   // Background sweep: evict sessions that have been idle beyond their TTL.
@@ -240,7 +281,7 @@ async function startHttpTransport(): Promise<void> {
     }
 
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    let transport: StreamableHTTPServerTransport;
+    let transport: StreamableHTTPServerTransportType;
     let server: McpServer;
 
     if (sessionId && sessions.has(sessionId)) {
