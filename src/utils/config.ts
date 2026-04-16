@@ -36,7 +36,7 @@ export function loadConfig(): Config {
     allowedOrigins: process.env.ALLOWED_ORIGINS,
     ssc: {
       apiBaseUrl: process.env.SSC_API_BASE_URL || 'https://api.securityscorecard.io',
-      apiKey: process.env.SSC_API_KEY,
+      apiKey: process.env.SSC_API_KEY || process.env.SSC_API_TOKEN,
     },
     oauth: {
       issuer: process.env.OAUTH_ISSUER,
