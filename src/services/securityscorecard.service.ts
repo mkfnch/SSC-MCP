@@ -31,6 +31,8 @@ export class SecurityScorecardService {
     this.apiKey = apiKey;
   }
 
+  private static readonly REQUEST_TIMEOUT_MS = 30_000; // 30 seconds
+
   private async request<T>(
     endpoint: string,
     options: {
@@ -68,6 +70,7 @@ export class SecurityScorecardService {
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(SecurityScorecardService.REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -84,6 +87,11 @@ export class SecurityScorecardService {
         response.status,
         endpoint
       );
+    }
+
+    // 204 No Content (common for DELETE/PUT) has no body to parse.
+    if (response.status === 204 || response.headers.get('content-length') === '0') {
+      return undefined as T;
     }
 
     return response.json() as Promise<T>;

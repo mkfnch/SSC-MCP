@@ -141,6 +141,9 @@ async function startHttpTransport(): Promise<void> {
     res.setHeader('Content-Security-Policy', "default-src 'none'"); // XSS
     res.setHeader('Cache-Control', 'no-store');                // sensitive data caching
     res.setHeader('Referrer-Policy', 'no-referrer');           // referrer leakage
+    if (config.nodeEnv === 'production') {
+      res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains'); // HSTS
+    }
     next();
   });
 
@@ -171,14 +174,14 @@ async function startHttpTransport(): Promise<void> {
   // ── Session store with TTL enforcement ────────────────────────────────────
   const sessions = new Map<
     string,
-    { transport: StreamableHTTPServerTransport; server: McpServer; createdAt: number }
+    { transport: StreamableHTTPServerTransport; server: McpServer; lastActivity: number }
   >();
 
-  // Background sweep: evict sessions that have exceeded their TTL.
+  // Background sweep: evict sessions that have been idle beyond their TTL.
   const _sessionSweeper = setInterval(() => {
     const now = Date.now();
     for (const [id, session] of sessions) {
-      if (now - session.createdAt > SESSION_TTL_MS) {
+      if (now - session.lastActivity > SESSION_TTL_MS) {
         session.transport.close().catch(() => {});
         sessions.delete(id);
         logger.info({ sessionId: id }, 'MCP session expired and evicted');
@@ -241,8 +244,9 @@ async function startHttpTransport(): Promise<void> {
     let server: McpServer;
 
     if (sessionId && sessions.has(sessionId)) {
-      // Existing session – resume it.
+      // Existing session – resume it and refresh TTL.
       const session = sessions.get(sessionId)!;
+      session.lastActivity = Date.now();
       transport = session.transport;
       server = session.server;
     } else if (!sessionId && isInitializeRequest(req.body)) {
@@ -337,7 +341,7 @@ async function startHttpTransport(): Promise<void> {
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => {
-          sessions.set(id, { transport, server, createdAt: Date.now() });
+          sessions.set(id, { transport, server, lastActivity: Date.now() });
           logger.info({ sessionId: id }, 'MCP session initialized');
         },
       });
@@ -397,11 +401,34 @@ async function startHttpTransport(): Promise<void> {
   });
 
   const port = config.port;
-  app.listen(port, () => {
+  const httpServer = app.listen(port, () => {
     logger.info({ port, transport: 'streamable-http' }, 'SecurityScorecard MCP server running');
     logger.info(`MCP endpoint: http://localhost:${port}/mcp`);
     logger.info(`Health check: http://localhost:${port}/health`);
   });
+
+  // ── Graceful shutdown ──────────────────────────────────────────────────────
+  // Allow in-flight requests to complete before exiting (Docker/K8s sends
+  // SIGTERM during rolling deployments).
+  const shutdown = () => {
+    logger.info('Shutdown signal received, closing HTTP server…');
+    httpServer.close(() => {
+      for (const [id, session] of sessions) {
+        session.transport.close().catch(() => {});
+        sessions.delete(id);
+      }
+      logger.info('All sessions closed, exiting');
+      process.exit(0);
+    });
+    // Force exit after 10 seconds if connections don't drain.
+    setTimeout(() => {
+      logger.warn('Graceful shutdown timed out, forcing exit');
+      process.exit(1);
+    }, 10_000).unref();
+  };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────

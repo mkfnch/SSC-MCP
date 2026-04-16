@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { SecurityScorecardService } from '../services/securityscorecard.service.js';
 import { formatResourceError } from '../utils/error.js';
+import { domainSchema } from '../utils/validation.js';
 
 export function registerResources(server: McpServer, ssc: SecurityScorecardService): void {
   server.resource(
@@ -8,7 +9,12 @@ export function registerResources(server: McpServer, ssc: SecurityScorecardServi
     'scorecard://{domain}',
     { description: 'Security scorecard for a company identified by domain', mimeType: 'application/json' },
     async (uri) => {
-      const domain = uri.pathname.replace(/^\/\//, '');
+      const raw = uri.pathname.replace(/^\/\//, '');
+      const parsed = domainSchema.safeParse(raw);
+      if (!parsed.success) {
+        return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify({ error: 'Invalid domain in resource URI.' }) }] };
+      }
+      const domain = parsed.data;
       try {
         const data = await ssc.getCompanyScore(domain);
         return { contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(data, null, 2) }] };
