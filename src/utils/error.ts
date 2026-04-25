@@ -7,6 +7,21 @@ import { logger } from './logger.js';
  */
 const isProduction = (process.env.NODE_ENV ?? 'production') === 'production';
 
+/**
+ * JSON.stringify can throw on circular references and BigInt values. Tool
+ * payloads come from upstream APIs we don't fully control, so we fall back
+ * to a generic shape rather than letting the tool handler reject and
+ * surface an opaque transport-level error to the MCP client.
+ */
+function safeStringify(value: unknown, indent?: number): string {
+  try {
+    return JSON.stringify(value, null, indent);
+  } catch (err) {
+    logger.warn({ err }, 'safeStringify fallback engaged');
+    return JSON.stringify({ error: 'Response could not be serialized to JSON.' });
+  }
+}
+
 export class SecurityScorecardError extends Error {
   public readonly statusCode: number;
   public readonly endpoint: string;
@@ -90,7 +105,7 @@ type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean
 export async function handleToolCall<T>(fn: () => Promise<T>): Promise<ToolResult> {
   try {
     const data = await fn();
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    return { content: [{ type: 'text', text: safeStringify(data, 2) }] };
   } catch (error) {
     return { content: [formatMcpError(error)], isError: true };
   }

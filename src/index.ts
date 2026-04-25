@@ -47,14 +47,26 @@ async function verifyBearerToken(token: string): Promise<boolean> {
   const jwks = getJwks();
   if (!jwks) return false;
   try {
-    await jwtVerify(token, jwks, {
+    const { payload } = await jwtVerify(token, jwks, {
       issuer: config.oauth.issuer ?? undefined,
       audience: config.oauth.audience ?? undefined,
     });
+    // Optional azp pinning: when configured, the token must explicitly name
+    // this server. jose verifies signature/issuer/audience but does not
+    // enforce azp, so we check it here.
+    if (config.oauth.azp && payload.azp !== config.oauth.azp) {
+      logger.debug(
+        { expected: config.oauth.azp, actual: payload.azp },
+        'JWT azp mismatch'
+      );
+      return false;
+    }
     return true;
-  } catch {
-    // Intentionally catch-all: log nothing here to avoid timing oracle; the
-    // caller emits a generic 401.
+  } catch (err) {
+    // Server-side only: surfacing the reason helps diagnose JWKS outages
+    // without changing the client-visible response (a generic 401), so no
+    // timing oracle is introduced.
+    logger.debug({ err }, 'JWT verification rejected');
     return false;
   }
 }
@@ -63,8 +75,12 @@ async function verifyBearerToken(token: string): Promise<boolean> {
 
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute sliding window
 const RATE_LIMIT_MAX       = 100;    // requests per window per client IP
+const RATE_LIMIT_MAX_KEYS  = 10_000; // hard cap on tracked client identifiers
 
 type RateBucket = { count: number; resetAt: number };
+// Map iteration order is insertion order, so the first key is the
+// least-recently-inserted — the natural eviction candidate when we hit the
+// hard cap.
 const rateLimitBuckets = new Map<string, RateBucket>();
 
 // Prune stale buckets periodically so the map doesn't grow without bound.
@@ -84,6 +100,13 @@ function allowRequest(clientIp: string): boolean {
   const now = Date.now();
   const bucket = rateLimitBuckets.get(clientIp);
   if (!bucket || now >= bucket.resetAt) {
+    // Hard cap: evict the oldest entry when we'd exceed the size limit. This
+    // bounds memory under pathological load (e.g. many distinct IPs hitting
+    // the server faster than the periodic pruner can run).
+    if (rateLimitBuckets.size >= RATE_LIMIT_MAX_KEYS) {
+      const oldestKey = rateLimitBuckets.keys().next().value;
+      if (oldestKey !== undefined) rateLimitBuckets.delete(oldestKey);
+    }
     rateLimitBuckets.set(clientIp, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
     return true;
   }
@@ -151,6 +174,8 @@ async function startStdioTransport(): Promise<void> {
 
 /** Maximum age of an idle MCP session before it is evicted. */
 const SESSION_TTL_MS = 30 * 60_000; // 30 minutes
+/** Maximum number of concurrent live sessions per client IP. */
+const MAX_SESSIONS_PER_IP = 50;
 
 async function startHttpTransport(): Promise<void> {
   // Dynamic imports — these modules are only needed for HTTP mode and
@@ -161,30 +186,59 @@ async function startHttpTransport(): Promise<void> {
     { isInitializeRequest },
     { default: express },
     { default: cors },
+    { default: helmet },
     { randomUUID },
   ] = await Promise.all([
     import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
     import('@modelcontextprotocol/sdk/types.js'),
     import('express'),
     import('cors'),
+    import('helmet'),
     import('node:crypto'),
   ]);
 
   const app = express();
+  app.disable('x-powered-by');
+
+  // ── Proxy trust ───────────────────────────────────────────────────────────
+  // Without an explicit TRUSTED_PROXY, leave Express's default (no trust) so
+  // that X-Forwarded-For from arbitrary clients cannot be used to forge a
+  // client identity for rate limiting. When set, the value is passed through
+  // verbatim — see config.ts for accepted forms.
+  if (config.trustedProxy) {
+    // Coerce "true"/"false" to booleans and numeric strings to numbers; pass
+    // anything else (CIDR list, named preset) through unchanged.
+    const tp = config.trustedProxy;
+    const parsed: boolean | number | string =
+      tp === 'true' ? true : tp === 'false' ? false : /^\d+$/.test(tp) ? Number(tp) : tp;
+    app.set('trust proxy', parsed);
+  }
 
   // ── Security response headers ─────────────────────────────────────────────
-  // Applied before every response, including errors, to prevent common
-  // browser-side attack vectors.
+  // helmet sets a hardened default set of headers (X-Content-Type-Options,
+  // X-Frame-Options, Referrer-Policy, Cross-Origin-*, Permissions-Policy, …).
+  // We override CSP to deny everything (this is a JSON-RPC API, not a web
+  // app) and disable HSTS outside production so local HTTP development still
+  // works.
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        useDefaults: false,
+        directives: { 'default-src': ["'none'"], 'frame-ancestors': ["'none'"] },
+      },
+      strictTransportSecurity:
+        config.nodeEnv === 'production'
+          ? { maxAge: 63072000, includeSubDomains: true }
+          : false,
+      crossOriginResourcePolicy: { policy: 'same-origin' },
+      frameguard: { action: 'deny' },
+    })
+  );
+
+  // Prevent caching of sensitive API responses. helmet does not set
+  // Cache-Control by default.
   app.use((_req, res, next) => {
-    res.removeHeader('X-Powered-By');                          // fingerprint reduction
-    res.setHeader('X-Content-Type-Options', 'nosniff');        // MIME sniffing
-    res.setHeader('X-Frame-Options', 'DENY');                  // clickjacking
-    res.setHeader('Content-Security-Policy', "default-src 'none'"); // XSS
-    res.setHeader('Cache-Control', 'no-store');                // sensitive data caching
-    res.setHeader('Referrer-Policy', 'no-referrer');           // referrer leakage
-    if (config.nodeEnv === 'production') {
-      res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains'); // HSTS
-    }
+    res.setHeader('Cache-Control', 'no-store');
     next();
   });
 
@@ -213,22 +267,44 @@ async function startHttpTransport(): Promise<void> {
   app.use(express.json({ limit: '100kb' }));
 
   // ── Session store with TTL enforcement ────────────────────────────────────
-  const sessions = new Map<
-    string,
-    { transport: StreamableHTTPServerTransportType; server: McpServer; lastActivity: number }
-  >();
+  type Session = {
+    transport: StreamableHTTPServerTransportType;
+    server: McpServer;
+    lastActivity: number;
+    clientIp: string;
+  };
+  const sessions = new Map<string, Session>();
+  const sessionCountByIp = new Map<string, number>();
+
+  const incIpCount = (ip: string) =>
+    sessionCountByIp.set(ip, (sessionCountByIp.get(ip) ?? 0) + 1);
+  const decIpCount = (ip: string) => {
+    const next = (sessionCountByIp.get(ip) ?? 1) - 1;
+    if (next <= 0) sessionCountByIp.delete(ip);
+    else sessionCountByIp.set(ip, next);
+  };
+
+  // Idempotent eviction so the sweeper, the access-time check, and
+  // transport.onclose all converge on the same bookkeeping.
+  const evictSession = (id: string, reason: string): void => {
+    const session = sessions.get(id);
+    if (!session) return;
+    sessions.delete(id);
+    decIpCount(session.clientIp);
+    session.transport.close().catch(() => {});
+    logger.info({ sessionId: id, reason }, 'MCP session evicted');
+  };
 
   // Background sweep: evict sessions that have been idle beyond their TTL.
+  // Runs every minute so the bound between "expired" and "evicted" is small.
   const _sessionSweeper = setInterval(() => {
     const now = Date.now();
     for (const [id, session] of sessions) {
       if (now - session.lastActivity > SESSION_TTL_MS) {
-        session.transport.close().catch(() => {});
-        sessions.delete(id);
-        logger.info({ sessionId: id }, 'MCP session expired and evicted');
+        evictSession(id, 'idle-ttl');
       }
     }
-  }, 5 * 60_000); // every 5 minutes
+  }, 60_000);
   _sessionSweeper.unref();
 
   // ── Health check ──────────────────────────────────────────────────────────
@@ -261,15 +337,11 @@ async function startHttpTransport(): Promise<void> {
 
   // ── MCP Streamable HTTP endpoint (POST) ───────────────────────────────────
   app.post('/mcp', async (req, res) => {
-    // Derive a stable client identifier for rate-limiting purposes.
-    // X-Forwarded-For is used when the server is deployed behind a trusted proxy
-    // (e.g. Kubernetes ingress, AWS ALB).  Fall back to the socket address.
-    const clientIp =
-      (req.headers['x-forwarded-for'] as string | undefined)
-        ?.split(',')[0]
-        ?.trim() ??
-      req.socket.remoteAddress ??
-      'unknown';
+    // req.ip honours the "trust proxy" setting configured above: it parses
+    // X-Forwarded-For only when the operator has opted in. Otherwise it
+    // returns the immediate socket address, so a client cannot forge a
+    // different identity to defeat the per-IP rate limiter.
+    const clientIp = req.ip ?? 'unknown';
 
     if (!allowRequest(clientIp)) {
       res.status(429).json({
@@ -284,14 +356,39 @@ async function startHttpTransport(): Promise<void> {
     let transport: StreamableHTTPServerTransportType;
     let server: McpServer;
 
-    if (sessionId && sessions.has(sessionId)) {
+    // Single Map.get avoids a TOCTOU window between has() and get() where the
+    // background sweeper could evict the session. The expiry check is
+    // duplicated here so a session that aged past its TTL between sweeps is
+    // rejected on first use rather than silently revived.
+    const existing = sessionId ? sessions.get(sessionId) : undefined;
+    const now = Date.now();
+    if (existing && now - existing.lastActivity > SESSION_TTL_MS) {
+      evictSession(sessionId!, 'idle-ttl-on-access');
+    }
+    const liveSession = existing && now - existing.lastActivity <= SESSION_TTL_MS ? existing : undefined;
+
+    if (liveSession) {
       // Existing session – resume it and refresh TTL.
-      const session = sessions.get(sessionId)!;
-      session.lastActivity = Date.now();
-      transport = session.transport;
-      server = session.server;
+      liveSession.lastActivity = now;
+      transport = liveSession.transport;
+      server = liveSession.server;
     } else if (!sessionId && isInitializeRequest(req.body)) {
       // ── New session initialisation ──────────────────────────────────────
+      // Per-IP session cap: protects against a single client opening many
+      // long-lived sessions (each consumes memory and an SSC service
+      // instance) without tripping the request-rate limiter.
+      if ((sessionCountByIp.get(clientIp) ?? 0) >= MAX_SESSIONS_PER_IP) {
+        res.status(429).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Too many concurrent sessions for this client. Close existing sessions and retry.',
+          },
+          id: null,
+        });
+        return;
+      }
+
       server = createServer();
 
       // Resolve the SSC API key, handling both OAuth and direct-key modes.
@@ -382,16 +479,14 @@ async function startHttpTransport(): Promise<void> {
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => {
-          sessions.set(id, { transport, server, lastActivity: Date.now() });
+          sessions.set(id, { transport, server, lastActivity: Date.now(), clientIp });
+          incIpCount(clientIp);
           logger.info({ sessionId: id }, 'MCP session initialized');
         },
       });
 
       transport.onclose = () => {
-        if (transport.sessionId) {
-          sessions.delete(transport.sessionId);
-          logger.info({ sessionId: transport.sessionId }, 'MCP session closed');
-        }
+        if (transport.sessionId) evictSession(transport.sessionId, 'transport-closed');
       };
 
       await server.connect(transport);
@@ -411,33 +506,38 @@ async function startHttpTransport(): Promise<void> {
     await transport.handleRequest(req, res, req.body);
   });
 
-  // ── GET /mcp – SSE stream for server-initiated notifications ─────────────
-  app.get('/mcp', async (req, res) => {
+  // Single Map.get instead of has()+get()! avoids TOCTOU with the sweeper,
+  // and an inline TTL check rejects sessions that have aged past their idle
+  // limit between sweeps.
+  const lookupSession = (req: import('express').Request, res: import('express').Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !sessions.has(sessionId)) {
+    const session = sessionId ? sessions.get(sessionId) : undefined;
+    if (session && Date.now() - session.lastActivity > SESSION_TTL_MS) {
+      evictSession(sessionId!, 'idle-ttl-on-access');
+    }
+    const live = session && Date.now() - session.lastActivity <= SESSION_TTL_MS ? session : undefined;
+    if (!live) {
       res.status(400).json({
         jsonrpc: '2.0',
         error: { code: -32000, message: 'Invalid or missing session ID.' },
         id: null,
       });
-      return;
+      return undefined;
     }
-    const session = sessions.get(sessionId)!;
+    return live;
+  };
+
+  // ── GET /mcp – SSE stream for server-initiated notifications ─────────────
+  app.get('/mcp', async (req, res) => {
+    const session = lookupSession(req, res);
+    if (!session) return;
     await session.transport.handleRequest(req, res);
   });
 
   // ── DELETE /mcp – explicit session termination ────────────────────────────
   app.delete('/mcp', async (req, res) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !sessions.has(sessionId)) {
-      res.status(400).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Invalid or missing session ID.' },
-        id: null,
-      });
-      return;
-    }
-    const session = sessions.get(sessionId)!;
+    const session = lookupSession(req, res);
+    if (!session) return;
     await session.transport.handleRequest(req, res);
   });
 
@@ -454,10 +554,7 @@ async function startHttpTransport(): Promise<void> {
   const shutdown = () => {
     logger.info('Shutdown signal received, closing HTTP server…');
     httpServer.close(() => {
-      for (const [id, session] of sessions) {
-        session.transport.close().catch(() => {});
-        sessions.delete(id);
-      }
+      for (const id of Array.from(sessions.keys())) evictSession(id, 'shutdown');
       logger.info('All sessions closed, exiting');
       process.exit(0);
     });

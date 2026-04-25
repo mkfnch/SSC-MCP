@@ -94,6 +94,19 @@ export class SecurityScorecardService {
       return undefined as T;
     }
 
+    // Defend against an upstream that returns HTML (e.g. WAF block page,
+    // proxy error) with a 200 status. response.json() would throw a
+    // SyntaxError that hides the real cause; surfacing a typed error with
+    // the actual content-type is more diagnosable.
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!/\bapplication\/(?:[\w.+-]+\+)?json\b/i.test(contentType)) {
+      throw new SecurityScorecardError(
+        `Unexpected response content-type: ${contentType || '(missing)'}`,
+        response.status,
+        endpoint
+      );
+    }
+
     return response.json() as Promise<T>;
   }
 
