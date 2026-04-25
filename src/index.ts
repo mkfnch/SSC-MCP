@@ -161,30 +161,45 @@ async function startHttpTransport(): Promise<void> {
     { isInitializeRequest },
     { default: express },
     { default: cors },
+    { default: helmet },
     { randomUUID },
   ] = await Promise.all([
     import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
     import('@modelcontextprotocol/sdk/types.js'),
     import('express'),
     import('cors'),
+    import('helmet'),
     import('node:crypto'),
   ]);
 
   const app = express();
+  app.disable('x-powered-by');
 
   // ── Security response headers ─────────────────────────────────────────────
-  // Applied before every response, including errors, to prevent common
-  // browser-side attack vectors.
+  // helmet sets a hardened default set of headers (X-Content-Type-Options,
+  // X-Frame-Options, Referrer-Policy, Cross-Origin-*, Permissions-Policy, …).
+  // We override CSP to deny everything (this is a JSON-RPC API, not a web
+  // app) and disable HSTS outside production so local HTTP development still
+  // works.
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        useDefaults: false,
+        directives: { 'default-src': ["'none'"], 'frame-ancestors': ["'none'"] },
+      },
+      strictTransportSecurity:
+        config.nodeEnv === 'production'
+          ? { maxAge: 63072000, includeSubDomains: true }
+          : false,
+      crossOriginResourcePolicy: { policy: 'same-origin' },
+      frameguard: { action: 'deny' },
+    })
+  );
+
+  // Prevent caching of sensitive API responses. helmet does not set
+  // Cache-Control by default.
   app.use((_req, res, next) => {
-    res.removeHeader('X-Powered-By');                          // fingerprint reduction
-    res.setHeader('X-Content-Type-Options', 'nosniff');        // MIME sniffing
-    res.setHeader('X-Frame-Options', 'DENY');                  // clickjacking
-    res.setHeader('Content-Security-Policy', "default-src 'none'"); // XSS
-    res.setHeader('Cache-Control', 'no-store');                // sensitive data caching
-    res.setHeader('Referrer-Policy', 'no-referrer');           // referrer leakage
-    if (config.nodeEnv === 'production') {
-      res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains'); // HSTS
-    }
+    res.setHeader('Cache-Control', 'no-store');
     next();
   });
 
