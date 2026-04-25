@@ -47,10 +47,20 @@ async function verifyBearerToken(token: string): Promise<boolean> {
   const jwks = getJwks();
   if (!jwks) return false;
   try {
-    await jwtVerify(token, jwks, {
+    const { payload } = await jwtVerify(token, jwks, {
       issuer: config.oauth.issuer ?? undefined,
       audience: config.oauth.audience ?? undefined,
     });
+    // Optional azp pinning: when configured, the token must explicitly name
+    // this server. jose verifies signature/issuer/audience but does not
+    // enforce azp, so we check it here.
+    if (config.oauth.azp && payload.azp !== config.oauth.azp) {
+      logger.debug(
+        { expected: config.oauth.azp, actual: payload.azp },
+        'JWT azp mismatch'
+      );
+      return false;
+    }
     return true;
   } catch (err) {
     // Server-side only: surfacing the reason helps diagnose JWKS outages
@@ -65,8 +75,12 @@ async function verifyBearerToken(token: string): Promise<boolean> {
 
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute sliding window
 const RATE_LIMIT_MAX       = 100;    // requests per window per client IP
+const RATE_LIMIT_MAX_KEYS  = 10_000; // hard cap on tracked client identifiers
 
 type RateBucket = { count: number; resetAt: number };
+// Map iteration order is insertion order, so the first key is the
+// least-recently-inserted — the natural eviction candidate when we hit the
+// hard cap.
 const rateLimitBuckets = new Map<string, RateBucket>();
 
 // Prune stale buckets periodically so the map doesn't grow without bound.
@@ -86,6 +100,13 @@ function allowRequest(clientIp: string): boolean {
   const now = Date.now();
   const bucket = rateLimitBuckets.get(clientIp);
   if (!bucket || now >= bucket.resetAt) {
+    // Hard cap: evict the oldest entry when we'd exceed the size limit. This
+    // bounds memory under pathological load (e.g. many distinct IPs hitting
+    // the server faster than the periodic pruner can run).
+    if (rateLimitBuckets.size >= RATE_LIMIT_MAX_KEYS) {
+      const oldestKey = rateLimitBuckets.keys().next().value;
+      if (oldestKey !== undefined) rateLimitBuckets.delete(oldestKey);
+    }
     rateLimitBuckets.set(clientIp, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
     return true;
   }
@@ -153,6 +174,8 @@ async function startStdioTransport(): Promise<void> {
 
 /** Maximum age of an idle MCP session before it is evicted. */
 const SESSION_TTL_MS = 30 * 60_000; // 30 minutes
+/** Maximum number of concurrent live sessions per client IP. */
+const MAX_SESSIONS_PER_IP = 50;
 
 async function startHttpTransport(): Promise<void> {
   // Dynamic imports — these modules are only needed for HTTP mode and
@@ -244,22 +267,44 @@ async function startHttpTransport(): Promise<void> {
   app.use(express.json({ limit: '100kb' }));
 
   // ── Session store with TTL enforcement ────────────────────────────────────
-  const sessions = new Map<
-    string,
-    { transport: StreamableHTTPServerTransportType; server: McpServer; lastActivity: number }
-  >();
+  type Session = {
+    transport: StreamableHTTPServerTransportType;
+    server: McpServer;
+    lastActivity: number;
+    clientIp: string;
+  };
+  const sessions = new Map<string, Session>();
+  const sessionCountByIp = new Map<string, number>();
+
+  const incIpCount = (ip: string) =>
+    sessionCountByIp.set(ip, (sessionCountByIp.get(ip) ?? 0) + 1);
+  const decIpCount = (ip: string) => {
+    const next = (sessionCountByIp.get(ip) ?? 1) - 1;
+    if (next <= 0) sessionCountByIp.delete(ip);
+    else sessionCountByIp.set(ip, next);
+  };
+
+  // Idempotent eviction so the sweeper, the access-time check, and
+  // transport.onclose all converge on the same bookkeeping.
+  const evictSession = (id: string, reason: string): void => {
+    const session = sessions.get(id);
+    if (!session) return;
+    sessions.delete(id);
+    decIpCount(session.clientIp);
+    session.transport.close().catch(() => {});
+    logger.info({ sessionId: id, reason }, 'MCP session evicted');
+  };
 
   // Background sweep: evict sessions that have been idle beyond their TTL.
+  // Runs every minute so the bound between "expired" and "evicted" is small.
   const _sessionSweeper = setInterval(() => {
     const now = Date.now();
     for (const [id, session] of sessions) {
       if (now - session.lastActivity > SESSION_TTL_MS) {
-        session.transport.close().catch(() => {});
-        sessions.delete(id);
-        logger.info({ sessionId: id }, 'MCP session expired and evicted');
+        evictSession(id, 'idle-ttl');
       }
     }
-  }, 5 * 60_000); // every 5 minutes
+  }, 60_000);
   _sessionSweeper.unref();
 
   // ── Health check ──────────────────────────────────────────────────────────
@@ -312,16 +357,38 @@ async function startHttpTransport(): Promise<void> {
     let server: McpServer;
 
     // Single Map.get avoids a TOCTOU window between has() and get() where the
-    // background sweeper could evict the session.
+    // background sweeper could evict the session. The expiry check is
+    // duplicated here so a session that aged past its TTL between sweeps is
+    // rejected on first use rather than silently revived.
     const existing = sessionId ? sessions.get(sessionId) : undefined;
+    const now = Date.now();
+    if (existing && now - existing.lastActivity > SESSION_TTL_MS) {
+      evictSession(sessionId!, 'idle-ttl-on-access');
+    }
+    const liveSession = existing && now - existing.lastActivity <= SESSION_TTL_MS ? existing : undefined;
 
-    if (existing) {
+    if (liveSession) {
       // Existing session – resume it and refresh TTL.
-      existing.lastActivity = Date.now();
-      transport = existing.transport;
-      server = existing.server;
+      liveSession.lastActivity = now;
+      transport = liveSession.transport;
+      server = liveSession.server;
     } else if (!sessionId && isInitializeRequest(req.body)) {
       // ── New session initialisation ──────────────────────────────────────
+      // Per-IP session cap: protects against a single client opening many
+      // long-lived sessions (each consumes memory and an SSC service
+      // instance) without tripping the request-rate limiter.
+      if ((sessionCountByIp.get(clientIp) ?? 0) >= MAX_SESSIONS_PER_IP) {
+        res.status(429).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Too many concurrent sessions for this client. Close existing sessions and retry.',
+          },
+          id: null,
+        });
+        return;
+      }
+
       server = createServer();
 
       // Resolve the SSC API key, handling both OAuth and direct-key modes.
@@ -412,16 +479,14 @@ async function startHttpTransport(): Promise<void> {
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => {
-          sessions.set(id, { transport, server, lastActivity: Date.now() });
+          sessions.set(id, { transport, server, lastActivity: Date.now(), clientIp });
+          incIpCount(clientIp);
           logger.info({ sessionId: id }, 'MCP session initialized');
         },
       });
 
       transport.onclose = () => {
-        if (transport.sessionId) {
-          sessions.delete(transport.sessionId);
-          logger.info({ sessionId: transport.sessionId }, 'MCP session closed');
-        }
+        if (transport.sessionId) evictSession(transport.sessionId, 'transport-closed');
       };
 
       await server.connect(transport);
@@ -441,11 +506,17 @@ async function startHttpTransport(): Promise<void> {
     await transport.handleRequest(req, res, req.body);
   });
 
-  // Single Map.get instead of has()+get()! avoids TOCTOU with the sweeper.
+  // Single Map.get instead of has()+get()! avoids TOCTOU with the sweeper,
+  // and an inline TTL check rejects sessions that have aged past their idle
+  // limit between sweeps.
   const lookupSession = (req: import('express').Request, res: import('express').Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     const session = sessionId ? sessions.get(sessionId) : undefined;
-    if (!session) {
+    if (session && Date.now() - session.lastActivity > SESSION_TTL_MS) {
+      evictSession(sessionId!, 'idle-ttl-on-access');
+    }
+    const live = session && Date.now() - session.lastActivity <= SESSION_TTL_MS ? session : undefined;
+    if (!live) {
       res.status(400).json({
         jsonrpc: '2.0',
         error: { code: -32000, message: 'Invalid or missing session ID.' },
@@ -453,7 +524,7 @@ async function startHttpTransport(): Promise<void> {
       });
       return undefined;
     }
-    return session;
+    return live;
   };
 
   // ── GET /mcp – SSE stream for server-initiated notifications ─────────────
@@ -483,10 +554,7 @@ async function startHttpTransport(): Promise<void> {
   const shutdown = () => {
     logger.info('Shutdown signal received, closing HTTP server…');
     httpServer.close(() => {
-      for (const [id, session] of sessions) {
-        session.transport.close().catch(() => {});
-        sessions.delete(id);
-      }
+      for (const id of Array.from(sessions.keys())) evictSession(id, 'shutdown');
       logger.info('All sessions closed, exiting');
       process.exit(0);
     });

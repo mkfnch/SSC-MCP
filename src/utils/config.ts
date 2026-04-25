@@ -35,6 +35,13 @@ const ConfigSchema = z.object({
     issuer: z.string().url().optional(),
     audience: z.string().url().optional(),
     jwksUri: z.string().url().optional(),
+    /**
+     * Optional expected `azp` (authorized party) claim. When set, the JWT
+     * must carry exactly this value or verification fails. Useful when the
+     * IdP issues a single audience to multiple clients and only one of
+     * them should be able to call this server.
+     */
+    azp: z.string().min(1).optional(),
   }),
   logLevel: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   nodeEnv: z.enum(['development', 'production', 'test']).default('production'),
@@ -56,6 +63,7 @@ export function loadConfig(): Config {
       issuer: process.env.OAUTH_ISSUER,
       audience: process.env.OAUTH_AUDIENCE,
       jwksUri: process.env.JWKS_URI,
+      azp: process.env.OAUTH_AZP,
     },
     logLevel: process.env.LOG_LEVEL || 'info',
     nodeEnv: process.env.NODE_ENV || 'production',
