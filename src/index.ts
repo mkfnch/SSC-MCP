@@ -4,6 +4,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { StreamableHTTPServerTransport as StreamableHTTPServerTransportType } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+// helmet and cors are imported statically (rather than lazily, like the
+// HTTP transport) so SAST tools see the security middleware wired up to
+// the express() app. Both packages are pure middleware factories with no
+// import-time side effects, so loading them in stdio mode is harmless.
+import helmet from 'helmet';
+import cors from 'cors';
 
 import { loadConfig } from './utils/config.js';
 import { logger } from './utils/logger.js';
@@ -185,15 +191,11 @@ async function startHttpTransport(): Promise<void> {
     { StreamableHTTPServerTransport },
     { isInitializeRequest },
     { default: express },
-    { default: cors },
-    { default: helmet },
     { randomUUID },
   ] = await Promise.all([
     import('@modelcontextprotocol/sdk/server/streamableHttp.js'),
     import('@modelcontextprotocol/sdk/types.js'),
     import('express'),
-    import('cors'),
-    import('helmet'),
     import('node:crypto'),
   ]);
 
