@@ -52,9 +52,11 @@ async function verifyBearerToken(token: string): Promise<boolean> {
       audience: config.oauth.audience ?? undefined,
     });
     return true;
-  } catch {
-    // Intentionally catch-all: log nothing here to avoid timing oracle; the
-    // caller emits a generic 401.
+  } catch (err) {
+    // Server-side only: surfacing the reason helps diagnose JWKS outages
+    // without changing the client-visible response (a generic 401), so no
+    // timing oracle is introduced.
+    logger.debug({ err }, 'JWT verification rejected');
     return false;
   }
 }
@@ -175,6 +177,20 @@ async function startHttpTransport(): Promise<void> {
   const app = express();
   app.disable('x-powered-by');
 
+  // ── Proxy trust ───────────────────────────────────────────────────────────
+  // Without an explicit TRUSTED_PROXY, leave Express's default (no trust) so
+  // that X-Forwarded-For from arbitrary clients cannot be used to forge a
+  // client identity for rate limiting. When set, the value is passed through
+  // verbatim — see config.ts for accepted forms.
+  if (config.trustedProxy) {
+    // Coerce "true"/"false" to booleans and numeric strings to numbers; pass
+    // anything else (CIDR list, named preset) through unchanged.
+    const tp = config.trustedProxy;
+    const parsed: boolean | number | string =
+      tp === 'true' ? true : tp === 'false' ? false : /^\d+$/.test(tp) ? Number(tp) : tp;
+    app.set('trust proxy', parsed);
+  }
+
   // ── Security response headers ─────────────────────────────────────────────
   // helmet sets a hardened default set of headers (X-Content-Type-Options,
   // X-Frame-Options, Referrer-Policy, Cross-Origin-*, Permissions-Policy, …).
@@ -276,15 +292,11 @@ async function startHttpTransport(): Promise<void> {
 
   // ── MCP Streamable HTTP endpoint (POST) ───────────────────────────────────
   app.post('/mcp', async (req, res) => {
-    // Derive a stable client identifier for rate-limiting purposes.
-    // X-Forwarded-For is used when the server is deployed behind a trusted proxy
-    // (e.g. Kubernetes ingress, AWS ALB).  Fall back to the socket address.
-    const clientIp =
-      (req.headers['x-forwarded-for'] as string | undefined)
-        ?.split(',')[0]
-        ?.trim() ??
-      req.socket.remoteAddress ??
-      'unknown';
+    // req.ip honours the "trust proxy" setting configured above: it parses
+    // X-Forwarded-For only when the operator has opted in. Otherwise it
+    // returns the immediate socket address, so a client cannot forge a
+    // different identity to defeat the per-IP rate limiter.
+    const clientIp = req.ip ?? 'unknown';
 
     if (!allowRequest(clientIp)) {
       res.status(429).json({
@@ -299,12 +311,15 @@ async function startHttpTransport(): Promise<void> {
     let transport: StreamableHTTPServerTransportType;
     let server: McpServer;
 
-    if (sessionId && sessions.has(sessionId)) {
+    // Single Map.get avoids a TOCTOU window between has() and get() where the
+    // background sweeper could evict the session.
+    const existing = sessionId ? sessions.get(sessionId) : undefined;
+
+    if (existing) {
       // Existing session – resume it and refresh TTL.
-      const session = sessions.get(sessionId)!;
-      session.lastActivity = Date.now();
-      transport = session.transport;
-      server = session.server;
+      existing.lastActivity = Date.now();
+      transport = existing.transport;
+      server = existing.server;
     } else if (!sessionId && isInitializeRequest(req.body)) {
       // ── New session initialisation ──────────────────────────────────────
       server = createServer();
@@ -426,33 +441,32 @@ async function startHttpTransport(): Promise<void> {
     await transport.handleRequest(req, res, req.body);
   });
 
-  // ── GET /mcp – SSE stream for server-initiated notifications ─────────────
-  app.get('/mcp', async (req, res) => {
+  // Single Map.get instead of has()+get()! avoids TOCTOU with the sweeper.
+  const lookupSession = (req: import('express').Request, res: import('express').Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !sessions.has(sessionId)) {
+    const session = sessionId ? sessions.get(sessionId) : undefined;
+    if (!session) {
       res.status(400).json({
         jsonrpc: '2.0',
         error: { code: -32000, message: 'Invalid or missing session ID.' },
         id: null,
       });
-      return;
+      return undefined;
     }
-    const session = sessions.get(sessionId)!;
+    return session;
+  };
+
+  // ── GET /mcp – SSE stream for server-initiated notifications ─────────────
+  app.get('/mcp', async (req, res) => {
+    const session = lookupSession(req, res);
+    if (!session) return;
     await session.transport.handleRequest(req, res);
   });
 
   // ── DELETE /mcp – explicit session termination ────────────────────────────
   app.delete('/mcp', async (req, res) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !sessions.has(sessionId)) {
-      res.status(400).json({
-        jsonrpc: '2.0',
-        error: { code: -32000, message: 'Invalid or missing session ID.' },
-        id: null,
-      });
-      return;
-    }
-    const session = sessions.get(sessionId)!;
+    const session = lookupSession(req, res);
+    if (!session) return;
     await session.transport.handleRequest(req, res);
   });
 
